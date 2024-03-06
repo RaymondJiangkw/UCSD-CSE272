@@ -337,7 +337,7 @@ class Trainer(object):
                  use_checkpoint="latest", # which ckpt to use at init time
                  use_tensorboardX=True, # whether to use tensorboard for logging
                  scheduler_update_every_step=False, # whether to call scheduler.step() after every train step
-                 ):
+        ):
         
         self.name = name
         self.opt = opt
@@ -513,7 +513,11 @@ class Trainer(object):
         pred_rgb = outputs['image']
 
         # MSE loss
-        loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
+        loss = self.criterion(pred_rgb, gt_rgb).mean(-1)
+        # loss = self.criterion(pred_rgb / (pred_rgb + 1.0), gt_rgb).mean(-1)
+        # loss = self.criterion(pred_rgb, gt_rgb / (1 - gt_rgb).clamp_min_(1e-2)).mean(-1) # [B, N, 3] --> [B, N]
+        # assert torch.all(torch.isfinite(loss))
+        # loss = self.criterion(pred_rgb / (pred_rgb.max() + 1E-8), gt_rgb / (gt_rgb.max() + 1E-8)).mean(-1) # [B, N, 3] --> [B, N]
 
         # patch-based rendering
         if self.opt.patch_size > 1:
@@ -583,11 +587,13 @@ class Trainer(object):
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
-        pred_depth = outputs['depth'].reshape(B, H, W)
+        # pred_rgb = pred_rgb / (pred_rgb + 1.0)
+        pred_rgb = torch.clamp(pred_rgb, 0.0, 1.0)
+        # pred_depth = outputs['depth'].reshape(B, H, W)
 
         loss = self.criterion(pred_rgb, gt_rgb).mean()
 
-        return pred_rgb, pred_depth, gt_rgb, loss
+        return pred_rgb, gt_rgb, loss
 
     # moved out bg_color and perturb for more flexible control...
     def test_step(self, data, bg_color=None, perturb=False):  
@@ -602,9 +608,9 @@ class Trainer(object):
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
-        pred_depth = outputs['depth'].reshape(-1, H, W)
+        # pred_depth = outputs['depth'].reshape(-1, H, W)
 
-        return pred_rgb, pred_depth
+        return pred_rgb # , pred_depth
 
 
     def save_mesh(self, save_path=None, resolution=256, threshold=10):
@@ -653,6 +659,10 @@ class Trainer(object):
             if self.epoch % self.eval_interval == 0:
                 self.evaluate_one_epoch(valid_loader)
                 self.save_checkpoint(full=False, best=True)
+            
+            if self.epoch % self.opt.upsample_interval == 0:
+                self.opt.num_steps = min(self.opt.num_steps * 2, self.opt.max_steps)
+                self.log(f"Doubling the steps into {self.opt.num_steps}")
 
         if self.use_tensorboardX and self.local_rank == 0:
             self.writer.close()
@@ -679,14 +689,14 @@ class Trainer(object):
 
         if write_video:
             all_preds = []
-            all_preds_depth = []
+            # all_preds_depth = []
 
         with torch.no_grad():
 
             for i, data in enumerate(loader):
                 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth = self.test_step(data)
+                    preds = self.test_step(data)
 
                 if self.opt.color_space == 'linear':
                     preds = linear_to_srgb(preds)
@@ -694,23 +704,23 @@ class Trainer(object):
                 pred = preds[0].detach().cpu().numpy()
                 pred = (pred * 255).astype(np.uint8)
 
-                pred_depth = preds_depth[0].detach().cpu().numpy()
-                pred_depth = (pred_depth * 255).astype(np.uint8)
+                # pred_depth = preds_depth[0].detach().cpu().numpy()
+                # pred_depth = (pred_depth * 255).astype(np.uint8)
 
                 if write_video:
                     all_preds.append(pred)
-                    all_preds_depth.append(pred_depth)
+                    # all_preds_depth.append(pred_depth)
                 else:
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_rgb.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
+                    # cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
 
                 pbar.update(loader.batch_size)
         
         if write_video:
             all_preds = np.stack(all_preds, axis=0)
-            all_preds_depth = np.stack(all_preds_depth, axis=0)
+            # all_preds_depth = np.stack(all_preds_depth, axis=0)
             imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
-            imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
+            # imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
 
         self.log(f"==> Finished Test.")
     
@@ -804,7 +814,7 @@ class Trainer(object):
         with torch.no_grad():
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 # here spp is used as perturb random seed! (but not perturb the first sample)
-                preds, preds_depth = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp)
+                preds = self.test_step(data, bg_color=bg_color, perturb=False if spp == 1 else spp)
 
         if self.ema is not None:
             self.ema.restore()
@@ -813,17 +823,17 @@ class Trainer(object):
         if downscale != 1:
             # TODO: have to permute twice with torch...
             preds = F.interpolate(preds.permute(0, 3, 1, 2), size=(H, W), mode='nearest').permute(0, 2, 3, 1).contiguous()
-            preds_depth = F.interpolate(preds_depth.unsqueeze(1), size=(H, W), mode='nearest').squeeze(1)
+            # preds_depth = F.interpolate(preds_depth.unsqueeze(1), size=(H, W), mode='nearest').squeeze(1)
 
         if self.opt.color_space == 'linear':
             preds = linear_to_srgb(preds)
 
         pred = preds[0].detach().cpu().numpy()
-        pred_depth = preds_depth[0].detach().cpu().numpy()
+        # pred_depth = preds_depth[0].detach().cpu().numpy()
 
         outputs = {
             'image': pred,
-            'depth': pred_depth,
+            # 'depth': pred_depth,
         }
 
         return outputs
@@ -862,8 +872,12 @@ class Trainer(object):
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
                 preds, truths, loss = self.train_step(data)
-         
+
+            # loss.backward()
+            # self.optimizer.step()
             self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1e1)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -881,6 +895,11 @@ class Trainer(object):
                 if self.use_tensorboardX:
                     self.writer.add_scalar("train/loss", loss_val, self.global_step)
                     self.writer.add_scalar("train/lr", self.optimizer.param_groups[0]['lr'], self.global_step)
+                    self.writer.add_scalar("train/majorant", self.model.sigma_majorant, self.global_step)
+                    # self.writer.add_scalar("train/Le_max", self.model.max_Le, self.global_step)
+                    # self.writer.add_scalar("train/Le_min", self.model.min_Le, self.global_step)
+                    self.writer.add_scalar("train/env_map_max", self.model.env_map.max(), self.global_step)
+                    self.writer.add_scalar("train/env_map_min", self.model.env_map.min(), self.global_step)
 
                 if self.scheduler_update_every_step:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
@@ -909,7 +928,7 @@ class Trainer(object):
             else:
                 self.lr_scheduler.step()
 
-        self.log(f"==> Finished Epoch {self.epoch}.")
+        self.log(f"==> Finished Epoch {self.epoch} with Majorant {self.model.sigma_majorant}.")
 
 
     def evaluate_one_epoch(self, loader, name=None):
@@ -939,7 +958,7 @@ class Trainer(object):
                 self.local_step += 1
 
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, preds_depth, truths, loss = self.eval_step(data)
+                    preds, truths, loss = self.eval_step(data)
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
@@ -950,9 +969,9 @@ class Trainer(object):
                     dist.all_gather(preds_list, preds)
                     preds = torch.cat(preds_list, dim=0)
 
-                    preds_depth_list = [torch.zeros_like(preds_depth).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
-                    dist.all_gather(preds_depth_list, preds_depth)
-                    preds_depth = torch.cat(preds_depth_list, dim=0)
+                    # preds_depth_list = [torch.zeros_like(preds_depth).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
+                    # dist.all_gather(preds_depth_list, preds_depth)
+                    # preds_depth = torch.cat(preds_depth_list, dim=0)
 
                     truths_list = [torch.zeros_like(truths).to(self.device) for _ in range(self.world_size)] # [[B, ...], [B, ...], ...]
                     dist.all_gather(truths_list, truths)
@@ -969,7 +988,7 @@ class Trainer(object):
 
                     # save image
                     save_path = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_rgb.png')
-                    save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
+                    # save_path_depth = os.path.join(self.workspace, 'validation', f'{name}_{self.local_step:04d}_depth.png')
 
                     #self.log(f"==> Saving validation image to {save_path}")
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -978,13 +997,14 @@ class Trainer(object):
                         preds = linear_to_srgb(preds)
 
                     pred = preds[0].detach().cpu().numpy()
+                    print(f"Predicted Image: min: {pred.min()}, max: {pred.max()}")
                     pred = (pred * 255).astype(np.uint8)
 
-                    pred_depth = preds_depth[0].detach().cpu().numpy()
-                    pred_depth = (pred_depth * 255).astype(np.uint8)
+                    # pred_depth = preds_depth[0].detach().cpu().numpy()
+                    # pred_depth = (pred_depth * 255).astype(np.uint8)
                     
                     cv2.imwrite(save_path, cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
-                    cv2.imwrite(save_path_depth, pred_depth)
+                    # cv2.imwrite(save_path_depth, pred_depth)
 
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                     pbar.update(loader.batch_size)

@@ -1,4 +1,5 @@
 import torch
+import dnnlib
 import argparse
 
 from nerf.provider import NeRFDataset
@@ -11,7 +12,6 @@ from loss import huber_loss
 #torch.autograd.set_detect_anomaly(True)
 
 if __name__ == '__main__':
-
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str)
     parser.add_argument('-O', action='store_true', help="equals --fp16 --cuda_ray --preload")
@@ -21,16 +21,19 @@ if __name__ == '__main__':
 
     ### training options
     parser.add_argument('--iters', type=int, default=30000, help="training iters")
-    parser.add_argument('--lr', type=float, default=1e-2, help="initial learning rate")
+    parser.add_argument('--lr', type=float, default=1e-4, help="initial learning rate")
     parser.add_argument('--ckpt', type=str, default='latest')
     parser.add_argument('--num_rays', type=int, default=4096, help="num rays sampled per image for each training step")
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
-    parser.add_argument('--max_steps', type=int, default=1024, help="max num steps sampled per ray (only valid when using --cuda_ray)")
-    parser.add_argument('--num_steps', type=int, default=512, help="num steps sampled per ray (only valid when NOT using --cuda_ray)")
+    parser.add_argument('--max_steps', type=int, default=128, help="max num steps sampled per ray")
+    parser.add_argument('--num_steps', type=int, default=128, help="num steps sampled per ray (only valid when NOT using --cuda_ray)")
     parser.add_argument('--upsample_steps', type=int, default=0, help="num steps up-sampled per ray (only valid when NOT using --cuda_ray)")
     parser.add_argument('--update_extra_interval', type=int, default=16, help="iter interval to update extra status (only valid when using --cuda_ray)")
-    parser.add_argument('--max_ray_batch', type=int, default=4096, help="batch size of rays at inference to avoid OOM (only valid when NOT using --cuda_ray)")
+    parser.add_argument('--max_ray_batch', type=int, default=2048, help="batch size of rays at inference to avoid OOM (only valid when NOT using --cuda_ray)")
     parser.add_argument('--patch_size', type=int, default=1, help="[experimental] render patches in training, so as to apply LPIPS loss. 1 means disabled, use [64, 32, 16] to enable")
+    parser.add_argument('--max_depths', type=int, default=2, help='maximum number of recursive evaluation of integration')
+    parser.add_argument('--rr_depth', type=int, default=5, help='When Russian roulette starts to take effects')
+    parser.add_argument('--upsample_interval', type=int, default=100, help="After number of epoches, doubling the number of steps")
 
     ### network backbone options
     parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training")
@@ -62,7 +65,7 @@ if __name__ == '__main__':
     parser.add_argument('--clip_text', type=str, default='', help="text input for CLIP guidance")
     parser.add_argument('--rand_pose', type=int, default=-1, help="<0 uses no rand pose, =0 only uses rand pose, >0 sample one rand pose every $ known poses")
 
-    opt = parser.parse_args()
+    opt = dnnlib.EasyDict(**vars(parser.parse_args()))
 
     if opt.O:
         opt.fp16 = True
@@ -84,7 +87,7 @@ if __name__ == '__main__':
         assert opt.bg_radius <= 0, "background model is not implemented for --tcnn"
         from nerf.network_tcnn import NeRFNetwork
     else:
-        from nerf.network import NeRFNetwork
+        from nerf.network_tcnn import NeRFNetwork
 
     print(opt)
     
@@ -104,7 +107,7 @@ if __name__ == '__main__':
 
     criterion = torch.nn.MSELoss(reduction='none')
     #criterion = partial(huber_loss, reduction='none')
-    #criterion = torch.nn.HuberLoss(reduction='none', beta=0.1) # only available after torch 1.10 ?
+    #criterion = torch.nn.HuberLoss(reduction='none', delta=0.1) # only available after torch 1.10 ?
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -137,7 +140,7 @@ if __name__ == '__main__':
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
 
         metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=50)
+        trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer, criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler, scheduler_update_every_step=False, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=5)
 
         if opt.gui:
             gui = NeRFGUI(opt, trainer, train_loader)
@@ -157,4 +160,4 @@ if __name__ == '__main__':
             
             trainer.test(test_loader, write_video=True) # test and save video
             
-            trainer.save_mesh(resolution=256, threshold=10)
+            # trainer.save_mesh(resolution=256, threshold=10)
