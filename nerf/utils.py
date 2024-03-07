@@ -513,8 +513,9 @@ class Trainer(object):
         pred_rgb = outputs['image']
 
         # MSE loss
-        loss = self.criterion(pred_rgb, gt_rgb).mean(-1)
-        # loss = self.criterion(pred_rgb / (pred_rgb + 1.0), gt_rgb).mean(-1)
+        # loss = self.criterion(pred_rgb, gt_rgb).mean(-1)
+        # print('Loss:', loss.max(), loss.min())
+        loss = self.criterion(pred_rgb / (pred_rgb + 1.0), gt_rgb).mean(-1)
         # loss = self.criterion(pred_rgb, gt_rgb / (1 - gt_rgb).clamp_min_(1e-2)).mean(-1) # [B, N, 3] --> [B, N]
         # assert torch.all(torch.isfinite(loss))
         # loss = self.criterion(pred_rgb / (pred_rgb.max() + 1E-8), gt_rgb / (gt_rgb.max() + 1E-8)).mean(-1) # [B, N, 3] --> [B, N]
@@ -587,7 +588,7 @@ class Trainer(object):
         outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
-        # pred_rgb = pred_rgb / (pred_rgb + 1.0)
+        pred_rgb = pred_rgb / (pred_rgb + 1.0)
         pred_rgb = torch.clamp(pred_rgb, 0.0, 1.0)
         # pred_depth = outputs['depth'].reshape(B, H, W)
 
@@ -755,12 +756,13 @@ class Trainer(object):
 
             self.optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-         
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            preds, truths, loss = self.train_step(data)
+
+            loss.backward()
+            self.optimizer.step()
+            # self.scaler.scale(loss).backward()
+            # self.scaler.step(self.optimizer)
+            # self.scaler.update()
             
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
@@ -870,16 +872,21 @@ class Trainer(object):
 
             self.optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
+            preds, truths, loss = self.train_step(data)
 
-            # loss.backward()
-            # self.optimizer.step()
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
+            loss.backward()
+
+            for name, tensor in self.model.named_parameters():
+                if torch.any(torch.isnan(tensor.grad)):
+                    print(loss, name, torch.isnan(tensor.grad).sum())
+                    tensor.grad = None
+
+            self.optimizer.step()
+            # self.scaler.scale(loss).backward()
+            # self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1e1)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            # self.scaler.step(self.optimizer)
+            # self.scaler.update()
 
             if self.scheduler_update_every_step:
                 self.lr_scheduler.step()
@@ -900,6 +907,9 @@ class Trainer(object):
                     # self.writer.add_scalar("train/Le_min", self.model.min_Le, self.global_step)
                     self.writer.add_scalar("train/env_map_max", self.model.env_map.max(), self.global_step)
                     self.writer.add_scalar("train/env_map_min", self.model.env_map.min(), self.global_step)
+                    if self.global_step % 1000 == 0:
+                        env_map = torch.exp(self.model.env_map)
+                        self.writer.add_images("train/env_map", env_map / (env_map.max() + 1E-8).clamp_min(1.), self.global_step)
 
                 if self.scheduler_update_every_step:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")
@@ -928,7 +938,7 @@ class Trainer(object):
             else:
                 self.lr_scheduler.step()
 
-        self.log(f"==> Finished Epoch {self.epoch} with Majorant {self.model.sigma_majorant}.")
+        # self.log(f"==> Finished Epoch {self.epoch} with Majorant {self.model.sigma_majorant}.")
 
 
     def evaluate_one_epoch(self, loader, name=None):

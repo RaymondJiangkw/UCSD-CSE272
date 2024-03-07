@@ -152,6 +152,8 @@ class GridEncoder(nn.Module):
 
         prefix_shape = list(inputs.shape[:-1])
         inputs = inputs.view(-1, self.input_dim)
+        # print(self.embeddings.max(), self.embeddings.min())
+        # assert torch.all(~torch.isnan(self.embeddings))
 
         outputs = grid_encode(inputs, self.embeddings, self.offsets, self.per_level_scale, self.base_resolution, inputs.requires_grad, self.gridtype_id, self.align_corners, self.interp_id)
         outputs = outputs.view(prefix_shape + [self.output_dim])

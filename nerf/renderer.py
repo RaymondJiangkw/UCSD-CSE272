@@ -86,8 +86,8 @@ class NeRFRenderer(nn.Module):
 
         # extra state for cuda raymarching
         self.cuda_ray = cuda_ray
-        self.sigma_majorant = 0.1 # Should be dynamically adjusted
-        self.env_map = torch.nn.Parameter(torch.rand(1, 3, 16, 32))
+        self.sigma_majorant = 1. # Should be dynamically adjusted
+        self.env_map = torch.nn.Parameter(torch.randn(1, 3, 128, 256))
     
     def forward(self, x, d):
         raise NotImplementedError()
@@ -131,7 +131,7 @@ class NeRFRenderer(nn.Module):
         b_rays_o = rays_o[:, None, :].expand(-1, tot, -1).reshape(-1, 3) # (n, 3)
         b_rays_d = rays_d[:, None, :].expand(-1, tot, -1).reshape(-1, 3) # (n, 3)
         b_rays_i = torch.arange(N).to(device).long().reshape(-1, 1).expand(-1, tot).reshape(-1) # (n)
-        current_throughput = torch.ones(len(b_rays_o), 1, device=device) # (n, 1)
+        current_throughput = torch.ones(len(b_rays_o), 3, device=device) # (n, 3)
 
         for current_depth in range(max_depths):
             if len(current_throughput) <= 0:
@@ -153,15 +153,12 @@ class NeRFRenderer(nn.Module):
             b_rays_i = b_rays_i[~invalid_mask]
             current_throughput = current_throughput[~invalid_mask]
             hit_pts = b_rays_o + b_rays_d * hit_t # (N, 3)
-
             if current_depth < max_depths - 1:
                 b_rays_t = (torch.log(1 - torch.rand(len(b_rays_o), 1, device=device)) / -self.sigma_majorant) # (n, 1)
             else:
                 b_rays_t = hit_t
             hit_mask = (b_rays_t >= hit_t).squeeze(dim=-1) # (n, )
-            rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * torch.exp(-self.sigma_majorant * hit_t[hit_mask]) * self.sample_env_map(hit_pts[hit_mask])
-            # print()
-            # print(f"Current Depth: {current_depth} with Hitting ratio {hit_mask.sum() / len(hit_mask)}")
+            rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * self.sample_env_map(hit_pts[hit_mask])
 
             if hit_mask.sum() == len(hit_mask):
                 break
@@ -172,9 +169,6 @@ class NeRFRenderer(nn.Module):
             b_rays_i = b_rays_i[~hit_mask]
             b_rays_t = b_rays_t[~hit_mask]
             current_throughput = current_throughput[~hit_mask]
-            assert torch.all(~torch.isnan(b_rays_o))
-            assert torch.all(~torch.isnan(b_rays_d))
-            assert torch.all(~torch.isnan(b_rays_t)), f"{b_rays_t}, {self.sigma_majorant}"
             b_rays_o = b_rays_o + b_rays_d * b_rays_t
             out = self.forward(b_rays_o, b_rays_d.clone())
             current_throughput = current_throughput / self.sigma_majorant  # Transmittance term cancels out
@@ -183,18 +177,19 @@ class NeRFRenderer(nn.Module):
             scatter_prob = out["sigma_t"] / self.sigma_majorant # (n, 1)
             scatter_mask = (torch.rand_like(scatter_prob) < scatter_prob).squeeze(-1) # (n, )
 
+            print(f"[Depth {current_depth}]: Scatter {scatter_mask.sum()/len(scatter_mask):<2f}%")
+
             # Hit Real Particles
-            rgbs[b_rays_i[scatter_mask]] = rgbs[b_rays_i[scatter_mask]] + current_throughput[scatter_mask] * out["Le"][scatter_mask]
+            # rgbs[b_rays_i[scatter_mask]] = rgbs[b_rays_i[scatter_mask]] + current_throughput[scatter_mask] * out["Le"][scatter_mask]
 
             if current_depth == max_depths - 1:
                 break
 
-            current_throughput[scatter_mask] = current_throughput[scatter_mask] * out["sigma_s"][scatter_mask] * out["rho"][scatter_mask] * torch.reciprocal(out["pdf_d_out"][scatter_mask])
+            current_throughput[scatter_mask] = current_throughput[scatter_mask] * out["fused_rho"][scatter_mask] / (scatter_prob[scatter_mask] + 1E-8)
             b_rays_d[scatter_mask] = out["d_out"][scatter_mask].to(b_rays_d.dtype)
-            assert torch.all(~torch.isnan(out["d_out"])), f"{out['d_out'].min()}, {out['d_out'].max()}"
-
+            
             # Hit Fake Particles
-            current_throughput[~scatter_mask] = current_throughput[~scatter_mask] * (self.sigma_majorant - out["sigma_t"][~scatter_mask])
+            current_throughput[~scatter_mask] = current_throughput[~scatter_mask] * (self.sigma_majorant - out["sigma_t"][~scatter_mask]) / (1 - scatter_prob[~scatter_mask] + 1E-8)
 
             # Russian roulette
             if current_depth >= rr_depth:
@@ -243,6 +238,6 @@ class NeRFRenderer(nn.Module):
         results['image'] = image
 
         # Dynamically adjust the majorant
-        self.sigma_majorant = max(max_sigma, 1e-3)
+        self.sigma_majorant = max_sigma
 
         return results
