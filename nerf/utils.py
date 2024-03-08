@@ -477,7 +477,7 @@ class Trainer(object):
             H, W = data['H'], data['W']
 
             # currently fix white bg, MUST force all rays!
-            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **vars(self.opt))
+            outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=None, perturb=True, force_all_rays=True, **(self.opt))
             pred_rgb = outputs['image'].reshape(B, H, W, 3).permute(0, 3, 1, 2).contiguous()
 
             # [debug] uncomment to plot the images used in train_step
@@ -506,9 +506,8 @@ class Trainer(object):
             gt_rgb = images[..., :3] * images[..., 3:] + bg_color * (1 - images[..., 3:])
         else:
             gt_rgb = images
-
-        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
-        # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **(self.opt))
+        # outputs = self.model.render(rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=True, **(self.opt))
     
         pred_rgb = outputs['image']
 
@@ -585,7 +584,7 @@ class Trainer(object):
         else:
             gt_rgb = images
         
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_rgb = pred_rgb / (pred_rgb + 1.0)
@@ -606,7 +605,7 @@ class Trainer(object):
         if bg_color is not None:
             bg_color = bg_color.to(self.device)
 
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **vars(self.opt))
+        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb, **(self.opt))
 
         pred_rgb = outputs['image'].reshape(-1, H, W, 3)
         # pred_depth = outputs['depth'].reshape(-1, H, W)
@@ -907,7 +906,7 @@ class Trainer(object):
                     # self.writer.add_scalar("train/Le_min", self.model.min_Le, self.global_step)
                     self.writer.add_scalar("train/env_map_max", self.model.env_map.max(), self.global_step)
                     self.writer.add_scalar("train/env_map_min", self.model.env_map.min(), self.global_step)
-                    if self.global_step % 1000 == 0:
+                    if self.global_step % 100 == 0:
                         env_map = torch.exp(self.model.env_map)
                         self.writer.add_images("train/env_map", env_map / (env_map.max() + 1E-8).clamp_min(1.), self.global_step)
 

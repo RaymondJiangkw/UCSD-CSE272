@@ -43,7 +43,7 @@ def sample_pdf(bins, weights, n_samples, det=False):
     t = (u - cdf_g[..., 0]) / denom
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
-    return samples
+    return samples, (cdf_g[..., 1] - cdf_g[..., 0]) * torch.reciprocal((bins_g[..., 1] - bins_g[..., 0]).clamp_min(1e-3))
 
 
 def plot_pointcloud(pc, color=None):
@@ -87,7 +87,7 @@ class NeRFRenderer(nn.Module):
         # extra state for cuda raymarching
         self.cuda_ray = cuda_ray
         self.sigma_majorant = 1. # Should be dynamically adjusted
-        self.env_map = torch.nn.Parameter(torch.randn(1, 3, 128, 256))
+        self.env_map = torch.nn.Parameter(torch.randn(1, 3, 128, 256) * 0.002)
     
     def forward(self, x, d):
         raise NotImplementedError()
@@ -116,7 +116,8 @@ class NeRFRenderer(nn.Module):
         # bg_color: [3] in range [0, 1]
         # return: image: [B, N, 3], depth: [B, N]
 
-        BOUND = self.bound
+        # choose aabb
+        aabb = self.aabb_train if self.training else self.aabb_infer
 
         max_sigma = -1
         prefix = rays_o.shape[:-1]
@@ -125,7 +126,7 @@ class NeRFRenderer(nn.Module):
 
         N = rays_o.shape[0] # N = B * N, in fact
         device = rays_o.device
-        tot = num_steps + upsample_steps
+        tot = num_steps
         rgbs = torch.zeros((N, 3), device=device, dtype=torch.float32)
 
         b_rays_o = rays_o[:, None, :].expand(-1, tot, -1).reshape(-1, 3) # (n, 3)
@@ -137,59 +138,58 @@ class NeRFRenderer(nn.Module):
             if len(current_throughput) <= 0:
                 break
 
-            # Hit Environment Map Bound
-            # || rays_o + rays_d * l ||^2_2 == bound ^ 2
-            hit_quadratic_a = torch.square(b_rays_d).sum(dim=-1) # (N, )
-            hit_quadratic_c = torch.square(b_rays_o).sum(dim=-1) - BOUND ** 2 # (N, )
-            hit_quadratic_b = 2.0 * (b_rays_o * b_rays_d).sum(dim=-1) # (N, )
-            hit_delta = hit_quadratic_b * hit_quadratic_b - 4.0 * hit_quadratic_a * hit_quadratic_c
-            invalid_mask = hit_delta <= 0.
-            hit_t = ((- hit_quadratic_b + torch.sqrt(hit_delta.clamp_min(0.))) / (2.0 * hit_quadratic_a))[:, None] # (N, 1)
-            invalid_mask = torch.logical_or(invalid_mask, hit_t.squeeze(-1) < 0.)
+            def estimate_transmittance(b_rays_o, b_rays_d, near, far):
+                # Using a biased estimator to estimate the integral
+                # Different from Null-scattering. Hopefully biased estimator can be 
+                # even more friendly to optimize.
+                z_vals = torch.lerp(near, far, torch.linspace(0., 1., upsample_steps, device=b_rays_t.device)[None, :]) # (N, M)
+                # Perturb sampled positions
+                sample_dist = (far - near) / upsample_steps # (N, 1)
+                z_vals = z_vals + (torch.rand(z_vals.shape, device=device) - 0.5) * sample_dist
+                # Upsample sampled positions (Importance Sampling)
+                with torch.no_grad():
+                    # print(b_rays_o.shape, b_rays_d.shape, z_vals.shape, (b_rays_o[:, None, :] + b_rays_d[:, None, :] * z_vals[:, :, None]).shape)
+                    sigma = self.density((b_rays_o[:, None, :] + b_rays_d[:, None, :] * z_vals[:, :, None]).reshape(-1, 3), b_rays_d[:, None, :].expand(-1, upsample_steps, -1).reshape(-1, 3)).reshape_as(z_vals) # (N, M)
+                    deltas = z_vals[..., 1:] - z_vals[..., :-1] # (N, M-1)
+                    deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1) # (N, M)
+                    alphas = 1 - torch.exp(-deltas * self.density_scale * sigma) # (N, M)
+                    alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # (N, M+1)
+                    weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # (N, M)
+                    z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # (N, M-1)
+                    new_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], upsample_steps, det=not self.training)[0].detach() # (N, M)
+                    z_vals = torch.sort(torch.cat((z_vals, new_z_vals), dim=-1), dim=-1).values # (N, 2 * M)
+                sigma = self.density((b_rays_o[:, None, :] + b_rays_d[:, None, :] * z_vals[:, :, None]).reshape(-1, 3), b_rays_d[:, None, :].expand(-1, 2 * upsample_steps, -1).reshape(-1, 3)).reshape_as(z_vals) # (N, 2 * M)
+                deltas = z_vals[..., 1:] - z_vals[..., :-1] # (N, 2 * M - 1)
+                deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1) # (N, 2 * M)
+                return torch.exp((- sigma * deltas).sum(dim=-1, keepdim=True)) # (N, 1)
 
-            hit_t = hit_t[~invalid_mask]
-            b_rays_o = b_rays_o[~invalid_mask]
-            b_rays_d = b_rays_d[~invalid_mask]
-            b_rays_i = b_rays_i[~invalid_mask]
-            current_throughput = current_throughput[~invalid_mask]
-            hit_pts = b_rays_o + b_rays_d * hit_t # (N, 3)
+            b_nears, b_fars = raymarching.near_far_from_aabb(b_rays_o, b_rays_d, aabb, self.min_near) # (n, )
+
             if current_depth < max_depths - 1:
-                b_rays_t = (torch.log(1 - torch.rand(len(b_rays_o), 1, device=device)) / -self.sigma_majorant) # (n, 1)
+                b_rays_t = ((torch.log(1 - torch.rand(len(b_rays_o), device=device)) / -self.sigma_majorant) + b_nears)[:, None] # (n, 1)
             else:
-                b_rays_t = hit_t
-            hit_mask = (b_rays_t >= hit_t).squeeze(dim=-1) # (n, )
-            rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * self.sample_env_map(hit_pts[hit_mask])
+                b_rays_t = b_fars[:, None]
+            hit_mask = (b_rays_t >= b_fars[:, None]).squeeze(dim=-1) # (n, )
+            if hit_mask.sum() > 0:
+                rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * estimate_transmittance(b_rays_o[hit_mask], b_rays_d[hit_mask], b_nears[:, None][hit_mask], b_fars[:, None][hit_mask]) * self.sample_env_map(b_rays_o[hit_mask] + b_rays_d[hit_mask] * b_fars[:, None][hit_mask]) / torch.exp(- self.sigma_majorant * (b_fars[:, None][hit_mask] - b_nears[:, None][hit_mask]) )
 
             if hit_mask.sum() == len(hit_mask):
                 break
 
-            hit_t = hit_t[~hit_mask]
-            b_rays_o = b_rays_o[~hit_mask]
-            b_rays_d = b_rays_d[~hit_mask]
-            b_rays_i = b_rays_i[~hit_mask]
-            b_rays_t = b_rays_t[~hit_mask]
-            current_throughput = current_throughput[~hit_mask]
+            b_rays_o = b_rays_o[~hit_mask]  # (N, 3)
+            b_rays_d = b_rays_d[~hit_mask]  # (N, 3)
+            b_rays_i = b_rays_i[~hit_mask]  # (N, )
+            b_rays_t = b_rays_t[~hit_mask]  # (N, 1)
+            b_nears  = b_nears[~hit_mask][:, None]   # (N, 1)
+            b_fars   = b_fars[~hit_mask][:, None]    # (N, 1)
+            current_throughput = current_throughput[~hit_mask]  # (N, 3)
+
             b_rays_o = b_rays_o + b_rays_d * b_rays_t
             out = self.forward(b_rays_o, b_rays_d.clone())
-            current_throughput = current_throughput / self.sigma_majorant  # Transmittance term cancels out
             # update max sigma
             max_sigma = max(max_sigma, out["raw_sigma_t"].max().item())
-            scatter_prob = out["sigma_t"] / self.sigma_majorant # (n, 1)
-            scatter_mask = (torch.rand_like(scatter_prob) < scatter_prob).squeeze(-1) # (n, )
-
-            print(f"[Depth {current_depth}]: Scatter {scatter_mask.sum()/len(scatter_mask):<2f}%")
-
-            # Hit Real Particles
-            # rgbs[b_rays_i[scatter_mask]] = rgbs[b_rays_i[scatter_mask]] + current_throughput[scatter_mask] * out["Le"][scatter_mask]
-
-            if current_depth == max_depths - 1:
-                break
-
-            current_throughput[scatter_mask] = current_throughput[scatter_mask] * out["fused_rho"][scatter_mask] / (scatter_prob[scatter_mask] + 1E-8)
-            b_rays_d[scatter_mask] = out["d_out"][scatter_mask].to(b_rays_d.dtype)
-            
-            # Hit Fake Particles
-            current_throughput[~scatter_mask] = current_throughput[~scatter_mask] * (self.sigma_majorant - out["sigma_t"][~scatter_mask]) / (1 - scatter_prob[~scatter_mask] + 1E-8)
+            b_rays_d = out["d_out"]
+            current_throughput = current_throughput * estimate_transmittance(b_rays_o, b_rays_d, b_nears, b_rays_t) * out["fused_rho"] / (self.sigma_majorant * torch.exp(-self.sigma_majorant * (b_rays_t - b_nears)))
 
             # Russian roulette
             if current_depth >= rr_depth:

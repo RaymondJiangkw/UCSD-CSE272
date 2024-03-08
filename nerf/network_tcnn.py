@@ -111,13 +111,23 @@ class NeRFNetwork(NeRFRenderer):
     def calc_PA(self, cov, d, d_p=None):
         if d_p is None: d_p = d
         return torch.sqrt((d[..., None, :] @ cov @ d_p[..., :, None]).squeeze(-1).clamp_min(0.))
+    
+    def density(self, x, d_i):
+        # sigma
+        x = (x + self.bound) / (2 * self.bound) # to [0, 1]
+        h = self.sigma_net(self.encoder(x.detach()))
+        sigma = torch.exp(h[..., 0:1])
+        scaling = torch.sigmoid(h[..., 1+3:1+3+3])
+        quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
+        cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
+        integral = self.calc_PA(cov, d_i)
+        raw_sigma_t = sigma * integral
+        sigma_t = torch.clamp(raw_sigma_t, 1e-3, self.sigma_majorant) # (N, 1)
+        return sigma_t
 
     def forward(self, x, d_i):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
-
-        assert torch.all(torch.logical_and(x > - self.bound, x < self.bound)), f"{x.min()}, {x.max()}, {self.bound}"
-
         # sigma
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
         h = self.sigma_net(self.encoder(x.detach()))
