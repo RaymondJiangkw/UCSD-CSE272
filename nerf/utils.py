@@ -908,7 +908,7 @@ class Trainer(object):
                     self.writer.add_scalar("train/env_map_min", self.model.env_map.min(), self.global_step)
                     if self.global_step % 100 == 0:
                         env_map = torch.exp(self.model.env_map)
-                        self.writer.add_images("train/env_map", env_map / (env_map.max() + 1E-8).clamp_min(1.), self.global_step)
+                        self.writer.add_images("train/env_map", (env_map - env_map.min()) / (env_map.max() - env_map.min() + 1E-8), self.global_step)
 
                 if self.scheduler_update_every_step:
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f}), lr={self.optimizer.param_groups[0]['lr']:.6f}")

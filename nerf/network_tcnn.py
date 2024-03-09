@@ -121,8 +121,8 @@ class NeRFNetwork(NeRFRenderer):
         quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
         cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
         integral = self.calc_PA(cov, d_i)
-        raw_sigma_t = sigma * integral
-        sigma_t = torch.clamp(raw_sigma_t, 1e-3, self.sigma_majorant) # (N, 1)
+        sigma_t = sigma * integral # (N, 1)
+        assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
         return sigma_t
 
     def forward(self, x, d_i):
@@ -137,8 +137,8 @@ class NeRFNetwork(NeRFRenderer):
         quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
         cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
         integral = self.calc_PA(cov, d_i)
-        raw_sigma_t = sigma * integral
-        sigma_t = torch.clamp(raw_sigma_t, 1e-3, self.sigma_majorant) # (N, 1)
+        sigma_t = sigma * integral # (N, 1)
+        assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
 
         # Importance Sampling VNDF
         @torch.no_grad()
@@ -174,15 +174,16 @@ class NeRFNetwork(NeRFRenderer):
             d_out_kji = torch.nn.functional.normalize(p_u * M_k[:, None, :] + p_v * M_j[:, None, :] + p_w * M_i[:, None, :], dim=-1) # (N, b, 3)
             return torch.nn.functional.normalize((torch.stack((omega_k, omega_j, omega_i), dim=-1) @ d_out_kji.transpose(-1, -2)).transpose(-1, -2), dim=-1).squeeze(-2) # (N, ?, 3)
 
-        d_m = sample_VNDF() # (N, 3)
+        d_m = sample_VNDF().detach() # (N, 3)
         mask = (d_m * d_i).sum(dim=-1) > 0
         d_m[mask] = -d_m[mask]
-        d_o = -d_i + 2.0 * d_m * (d_m * d_i).sum(dim=-1, keepdim=True)
-
-        fused_rho = alpha * integral * torch.reciprocal((d_m * d_i).sum(dim=-1, keepdim=True).abs() + 1E-8)
-
+        d_o = (-d_i + 2.0 * d_m * (d_m * d_i).sum(dim=-1, keepdim=True)).detach()
+        
+        rho = self.calc_NDF(scaling, cov_inv, d_m) / (4.0 * integral)
+        fused_rho = alpha * sigma_t * rho / (rho.detach() + 1E-8)
+        
         return {
-            'raw_sigma_t': raw_sigma_t.detach(), 
+            'raw_sigma_t': sigma_t.detach(), 
             'sigma_t': sigma_t, 
             'fused_rho': fused_rho, 
             'd_out': d_o, 
