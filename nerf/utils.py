@@ -584,7 +584,7 @@ class Trainer(object):
         else:
             gt_rgb = images
         
-        outputs = self.model.render(rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **(self.opt))
+        outputs = self.model.render(rays_o, rays_d, bg_color=bg_color, perturb=False, **(self.opt))
 
         pred_rgb = outputs['image'].reshape(B, H, W, 3)
         pred_rgb = pred_rgb / (pred_rgb + 1.0)

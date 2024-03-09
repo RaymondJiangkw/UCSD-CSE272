@@ -91,7 +91,7 @@ class NeRFNetwork(NeRFRenderer):
                 in_dim = hidden_dim
             
             if l == num_layers - 1:
-                out_dim = 1 + 3
+                out_dim = 1 + 3 + 3 + 4
             else:
                 out_dim = hidden_dim
             
@@ -116,7 +116,13 @@ class NeRFNetwork(NeRFRenderer):
         # sigma
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
         h = self.sigma_net(self.encoder(x.detach()))
-        sigma_t = torch.exp(h[..., :1])
+        sigma = torch.exp(h[..., 0:1])
+        scaling = torch.sigmoid(h[..., 1+3:1+3+3])
+        quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
+        cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
+        integral = self.calc_PA(cov, d_i)
+        sigma_t = sigma * integral # (N, 1)
+        assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
         return sigma_t
 
     def forward(self, x, d_i):
@@ -125,12 +131,56 @@ class NeRFNetwork(NeRFRenderer):
         # sigma
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
         h = self.sigma_net(self.encoder(x.detach()))
-        sigma_t = torch.exp(h[..., :1])
-        alpha = torch.sigmoid(h[..., 1:])
+        sigma = torch.exp(h[..., 0:1])
+        alpha = torch.sigmoid(h[..., 1:1+3])
+        scaling = torch.sigmoid(h[..., 1+3:1+3+3])
+        quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
+        cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
+        integral = self.calc_PA(cov, d_i)
+        sigma_t = sigma * integral # (N, 1)
+        assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
 
-        d_o = torch.nn.functional.normalize(torch.randn_like(d_i), dim=-1)
+        # Importance Sampling VNDF
+        @torch.no_grad()
+        def sample_VNDF(batch_size=1):
+            omega_i = d_i
+            omega_j = torch.nn.functional.normalize(torch.cross(torch.tensor([0., 0., 1.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i), omega_i))
+            omega_k = torch.nn.functional.normalize(torch.cross(omega_i, omega_j))
+            S_kk = self.calc_PA(cov, omega_k, omega_k)
+            S_kj = self.calc_PA(cov, omega_k, omega_j)
+            S_ki = self.calc_PA(cov, omega_k, omega_i)
+            S_jj = self.calc_PA(cov, omega_j, omega_j)
+            S_ji = self.calc_PA(cov, omega_j, omega_i)
+            S_ii = self.calc_PA(cov, omega_i, omega_i)
+            S_kji = torch.concatenate((
+                S_kk, S_kj, S_ki, 
+                S_kj, S_jj, S_ji, 
+                S_ki, S_ji, S_ii, 
+            ), dim=-1).reshape(-1, 3, 3)
+            M_k = torch.sqrt((torch.linalg.det(S_kji)[..., None] * (1 / (S_jj * S_ii - S_ji * S_ji))).clamp_min(0.))
+            M_k = torch.concatenate((M_k, torch.zeros_like(M_k), torch.zeros_like(M_k)), dim=-1)
+            M_j_1 = - (S_ki * S_ji - S_kj * S_ii) * torch.rsqrt(torch.clamp_min(S_jj * S_ii - S_ji * S_ji, 1e-8))
+            M_j_2 = torch.sqrt(torch.clamp_min(S_jj * S_ii - S_ji * S_ji, 0.))
+            M_j = torch.rsqrt(S_ii.clamp_min(1e-8)) * torch.concatenate((M_j_1, M_j_2, torch.zeros_like(M_j_1)), dim=-1)
+            M_i = torch.rsqrt(S_ii.clamp_min(1e-8)) * torch.concatenate((S_ki, S_ji, S_ii), dim=-1)
+
+            B = S_kk.shape[0]
+            
+            U_1 = torch.rand(B, batch_size, 1, device='cuda')
+            U_2 = torch.rand(B, batch_size, 1, device='cuda')
+            p_u = torch.sqrt(U_1) * torch.cos(2 * torch.pi * U_2)
+            p_v = torch.sqrt(U_1) * torch.sin(2 * torch.pi * U_2)
+            p_w = torch.sqrt(1 - p_u ** 2 - p_v ** 2)
+            d_out_kji = torch.nn.functional.normalize(p_u * M_k[:, None, :] + p_v * M_j[:, None, :] + p_w * M_i[:, None, :], dim=-1) # (N, b, 3)
+            return torch.nn.functional.normalize((torch.stack((omega_k, omega_j, omega_i), dim=-1) @ d_out_kji.transpose(-1, -2)).transpose(-1, -2), dim=-1).squeeze(-2) # (N, ?, 3)
+
+        d_m = sample_VNDF().detach() # (N, 3)
+        mask = (d_m * d_i).sum(dim=-1) > 0
+        d_m[mask] = -d_m[mask]
+        d_o = (-d_i + 2.0 * d_m * (d_m * d_i).sum(dim=-1, keepdim=True)).detach()
         
-        fused_rho = alpha * 2.0
+        rho = self.calc_NDF(scaling, cov_inv, d_m) / (4.0 * integral)
+        fused_rho = alpha * sigma_t * rho / (rho.detach() + 1E-8)
         
         return {
             'raw_sigma_t': sigma_t.detach(), 
