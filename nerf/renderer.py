@@ -87,7 +87,7 @@ class NeRFRenderer(nn.Module):
         # extra state for cuda raymarching
         self.cuda_ray = cuda_ray
         self.sigma_majorant = 1. # Should be dynamically adjusted
-        self.env_map = torch.nn.Parameter(torch.randn(1, 3, 128, 256) * 0.002)
+        self.env_map = torch.nn.Parameter(torch.randn(1, 3, 32, 64) * 0.002)
     
     def forward(self, x, d):
         raise NotImplementedError()
@@ -106,7 +106,7 @@ class NeRFRenderer(nn.Module):
         x, y, z = inputs.unbind(dim=-1)
         theta = (1 / np.pi) * torch.arctan2(x, -z).nan_to_num()[..., None] # (N, 1) in [-1, 1]
         phi = (2 * (1 / np.pi) * torch.arccos(y).nan_to_num() - 1)[..., None] # (N, 1) in [-1, 1]
-        coords = torch.stack([ phi, theta ], dim=-1)[None, :, :, :] # (1, N, 1, 2)
+        coords = torch.stack([ theta, phi ], dim=-1)[None, :, :, :] # (1, N, 1, 2)
         # print("Coords:", coords)
         Le = torch.exp(F.grid_sample(self.env_map, coords, mode='bilinear', align_corners=False).view(3, -1).permute(1, 0)) # (N, 3)
         return Le
@@ -129,8 +129,8 @@ class NeRFRenderer(nn.Module):
         tot = num_steps
         rgbs = torch.zeros((N * tot, 3), device=device, dtype=torch.float32)
 
-        b_rays_o = rays_o[:, None, :].expand(-1, tot, -1).reshape(-1, 3) # (n, 3)
-        b_rays_d = rays_d[:, None, :].expand(-1, tot, -1).reshape(-1, 3) # (n, 3)
+        b_rays_o = rays_o[:, None, :].expand(-1, tot, -1).contiguous().reshape(-1, 3) # (n, 3)
+        b_rays_d = rays_d[:, None, :].expand(-1, tot, -1).contiguous().reshape(-1, 3) # (n, 3)
         b_rays_i = torch.arange(N * tot).to(device).long() # (n)
         current_throughput = torch.ones(len(b_rays_o), 3, device=device) # (n, 3)
 
@@ -169,52 +169,54 @@ class NeRFRenderer(nn.Module):
             hit_c = torch.square(b_rays_o).sum(dim=-1) - self.bound ** 2
             hit_delta = hit_b ** 2 - 4.0 * hit_a * hit_c
             invalid_mask = hit_delta <= 0.
-            b_rays_o = b_rays_o[~invalid_mask]
-            b_rays_d = b_rays_d[~invalid_mask]
-            b_rays_i = b_rays_i[~invalid_mask]
-            current_throughput = current_throughput[~invalid_mask]
-            hit_a = hit_a[~invalid_mask]
-            hit_b = hit_b[~invalid_mask]
-            hit_c = hit_c[~invalid_mask]
-            hit_delta = hit_delta[~invalid_mask]
-
-            b_nears = (-hit_b - torch.sqrt(hit_delta)) / (2.0 * hit_a)
-            b_fars = (-hit_b + torch.sqrt(hit_delta)) / (2.0 * hit_a)
+            b_rays_o = b_rays_o[~invalid_mask].contiguous()
+            b_rays_d = b_rays_d[~invalid_mask].contiguous()
+            b_rays_i = b_rays_i[~invalid_mask].contiguous()
+            current_throughput = current_throughput[~invalid_mask].contiguous()
+            hit_a = hit_a[~invalid_mask].contiguous()
+            hit_b = hit_b[~invalid_mask].contiguous()
+            hit_c = hit_c[~invalid_mask].contiguous()
+            hit_delta = hit_delta[~invalid_mask].contiguous()
             
-            with torch.no_grad():
-                _z_vals = torch.linspace(0.0, 1.0, indicator_steps, device=device).unsqueeze(0) # [1, T]
-                _z_vals = _z_vals.expand((len(b_rays_o), indicator_steps)) # [N, T]
-                _z_vals = b_nears[:, None] + (b_fars - b_nears)[:, None] * _z_vals # [N, T], in [nears, fars]
-                _sample_dist = (b_fars - b_nears)[:, None] / indicator_steps
-                _z_vals = _z_vals + (torch.rand(_z_vals.shape, device=device) - 0.5) * _sample_dist
-                _sigma = self.density((b_rays_o[:, None, :] + b_rays_d[:, None, :] * _z_vals[:, :, None]).reshape(-1, 3), b_rays_d[:, None, :].expand(-1, indicator_steps, -1).reshape(-1, 3)).reshape_as(_z_vals) # [N, T]
-                b_rays_majorant = torch.clamp_min(torch.max(_sigma, dim=-1).values, 1e-3)
+            b_nears = ((-hit_b - torch.sqrt(hit_delta)) / (2.0 * hit_a)).clamp_min(1e-3)
+            b_fars = ((-hit_b + torch.sqrt(hit_delta)) / (2.0 * hit_a)).clamp_min(1e-3)
+            _z_vals = torch.linspace(0.0, 1.0, indicator_steps, device=device).unsqueeze(0) # [1, T]
+            _z_vals = _z_vals.expand((len(b_rays_o), indicator_steps)) # [N, T]
+            _z_vals = b_nears[:, None] + (b_fars - b_nears)[:, None] * _z_vals # [N, T], in [nears, fars]
+            _sample_dist = (b_fars - b_nears)[:, None] / indicator_steps
+            _z_vals = _z_vals + (torch.rand(_z_vals.shape, device=device) - 0.5) * _sample_dist
+            _sigma = self.density((b_rays_o[:, None, :] + b_rays_d[:, None, :] * _z_vals[:, :, None]).reshape(-1, 3), b_rays_d[:, None, :].expand(-1, indicator_steps, -1).reshape(-1, 3)).reshape_as(_z_vals) # [N, T]
+            b_rays_majorant = torch.clamp_min(torch.max(_sigma, dim=-1).values, 1e-3)
             if current_depth < max_depths - 1:
                 b_rays_t = ((torch.log(1 - torch.rand(len(b_rays_o), device=device)) / -b_rays_majorant) + b_nears)[:, None] # (n, 1)
             else:
                 b_rays_t = b_fars[:, None]
+            # print('b_rays_t:', b_rays_t.min(), b_rays_t.max())
             hit_mask = (b_rays_t >= b_fars[:, None]).squeeze(dim=-1) # (n, )
             if hit_mask.sum() > 0:
-                rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * estimate_transmittance(b_rays_o[hit_mask], b_rays_d[hit_mask], b_nears[:, None][hit_mask], b_fars[:, None][hit_mask]) * self.sample_env_map(b_rays_o[hit_mask] + b_rays_d[hit_mask] * b_fars[:, None][hit_mask]) / (torch.exp(- b_rays_majorant[:, None][hit_mask] * (b_fars[:, None][hit_mask] - b_nears[:, None][hit_mask])) + 1E-8)
+                denom = torch.exp(- b_rays_majorant[:, None][hit_mask] * (b_fars[:, None][hit_mask] - b_nears[:, None][hit_mask])) + 1E-8
+                # print('denom:', denom.min(), denom.max())
+                rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * estimate_transmittance(b_rays_o[hit_mask], b_rays_d[hit_mask], b_nears[:, None][hit_mask], b_fars[:, None][hit_mask]) * self.sample_env_map(b_rays_o[hit_mask] + b_rays_d[hit_mask] * b_fars[:, None][hit_mask]) / denom
 
             if hit_mask.sum() == len(hit_mask):
                 break
             
-            b_rays_o = b_rays_o[~hit_mask]  # (N, 3)
-            b_rays_d = b_rays_d[~hit_mask]  # (N, 3)
-            b_rays_i = b_rays_i[~hit_mask]  # (N, )
-            b_rays_t = b_rays_t[~hit_mask]  # (N, 1)
-            b_rays_majorant = b_rays_majorant[~hit_mask] # (N, )
-            b_nears  = b_nears[~hit_mask][:, None]   # (N, 1)
-            b_fars   = b_fars[~hit_mask][:, None]    # (N, 1)
-            current_throughput = current_throughput[~hit_mask]  # (N, 3)
-
-            b_rays_o = b_rays_o + b_rays_d * b_rays_t
-            out = self.forward(b_rays_o, b_rays_d.clone())
+            b_rays_o = b_rays_o[~hit_mask].contiguous()  # (N, 3)
+            b_rays_d = b_rays_d[~hit_mask].contiguous()  # (N, 3)
+            b_rays_i = b_rays_i[~hit_mask].contiguous()  # (N, )
+            b_rays_t = b_rays_t[~hit_mask].contiguous()  # (N, 1)
+            b_rays_majorant = b_rays_majorant[~hit_mask].contiguous() # (N, )
+            b_nears  = b_nears[~hit_mask][:, None].contiguous()   # (N, 1)
+            b_fars   = b_fars[~hit_mask][:, None].contiguous()    # (N, 1)
+            current_throughput = current_throughput[~hit_mask].contiguous()  # (N, 3)
+            b_rays_o = (b_rays_o + b_rays_d * b_rays_t).detach()
+            out = self.forward(b_rays_o, b_rays_d)
             # update max sigma
             max_sigma = max(max_sigma, b_rays_majorant.max().item())
             b_rays_d = out["d_out"]
-            current_throughput = current_throughput * estimate_transmittance(b_rays_o, b_rays_d, b_nears, b_rays_t) * out["fused_rho"] / (b_rays_majorant[:, None] * torch.exp(-b_rays_majorant[:, None] * (b_rays_t - b_nears)) + 1E-8)
+            denom = b_rays_majorant[:, None] * torch.exp(-b_rays_majorant[:, None] * (b_rays_t - b_nears)) + 1E-8
+            current_throughput = current_throughput * estimate_transmittance(b_rays_o, b_rays_d, b_nears, b_rays_t.detach()) * out["fused_rho"] / denom
+            # print('denom 2:', denom.min(), denom.max())
 
             # Russian roulette
             if current_depth >= rr_depth:
@@ -239,7 +241,7 @@ class NeRFRenderer(nn.Module):
             'max_sigma': max_sigma, 
         }
 
-    def render(self, rays_o, rays_d, staged=False, max_ray_batch=4096, **kwargs):
+    def render(self, rays_o, rays_d, staged=False, max_ray_batch=4096, show_progress_bar=False, **kwargs):
         # rays_o, rays_d: [B, N, 3], assumes B == 1
         # return: pred_rgb: [B, N, 3]
 
@@ -248,7 +250,6 @@ class NeRFRenderer(nn.Module):
 
         image = torch.empty((B, N, 3), device=device)
         max_sigma = -1
-
         for b in range(B):
             head = 0
             while head < N:

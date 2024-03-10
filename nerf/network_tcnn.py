@@ -7,6 +7,119 @@ import numpy as np
 from encoding import get_encoder
 from .renderer import NeRFRenderer
 
+BOX_OFFSETS = torch.tensor([[[i,j,k] for i in [0, 1] for j in [0, 1] for k in [0, 1]]],
+                               device='cuda')
+
+def hash(coords, log2_hashmap_size):
+    '''
+    coords: this function can process upto 7 dim coordinates
+    log2T:  logarithm of T w.r.t 2
+    '''
+    primes = [1, 2654435761, 805459861, 3674653429, 2097192037, 1434869437, 2165219737]
+
+    xor_result = torch.zeros_like(coords)[..., 0]
+    for i in range(coords.shape[-1]):
+        xor_result ^= coords[..., i]*primes[i]
+
+    return torch.tensor((1<<log2_hashmap_size)-1).to(xor_result.device) & xor_result
+
+def get_voxel_vertices(xyz, bounding_box, resolution, log2_hashmap_size):
+    '''
+    xyz: 3D coordinates of samples. B x 3
+    bounding_box: min and max x,y,z coordinates of object bbox
+    resolution: number of voxels per axis
+    '''
+    box_min, box_max = bounding_box
+
+    if not torch.all(xyz <= box_max) or not torch.all(xyz >= box_min):
+        # print("ALERT: some points are outside bounding box. Clipping them!")
+        xyz = torch.clamp(xyz, min=box_min, max=box_max)
+
+    grid_size = (box_max-box_min)/resolution
+    
+    bottom_left_idx = torch.floor((xyz-box_min)/grid_size).int()
+    voxel_min_vertex = bottom_left_idx*grid_size + box_min
+    voxel_max_vertex = voxel_min_vertex + torch.tensor([1.0,1.0,1.0], device='cuda')*grid_size
+
+    voxel_indices = bottom_left_idx.unsqueeze(1) + BOX_OFFSETS
+    hashed_voxel_indices = hash(voxel_indices, log2_hashmap_size)
+
+    return voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices
+
+class HashEmbedder(nn.Module):
+    def __init__(self, bounding_box, n_levels=16, n_features_per_level=2,\
+                log2_hashmap_size=19, base_resolution=16, finest_resolution=512):
+        super(HashEmbedder, self).__init__()
+        self.bounding_box = bounding_box
+        self.n_levels = n_levels
+        self.n_features_per_level = n_features_per_level
+        self.log2_hashmap_size = log2_hashmap_size
+        self.base_resolution = torch.tensor(base_resolution)
+        self.finest_resolution = torch.tensor(finest_resolution)
+        self.out_dim = self.n_levels * self.n_features_per_level
+
+        self.b = torch.exp((torch.log(self.finest_resolution)-torch.log(self.base_resolution))/(n_levels-1))
+
+        self.embeddings = nn.ModuleList([nn.Embedding(2**self.log2_hashmap_size, \
+                                        self.n_features_per_level) for i in range(n_levels)])
+        # custom uniform initialization
+        for i in range(n_levels):
+            nn.init.uniform_(self.embeddings[i].weight, a=-0.0001, b=0.0001)
+            # self.embeddings[i].weight.data.zero_()
+        
+
+    def trilinear_interp(self, x, voxel_min_vertex, voxel_max_vertex, voxel_embedds):
+        '''
+        x: B x 3
+        voxel_min_vertex: B x 3
+        voxel_max_vertex: B x 3
+        voxel_embedds: B x 8 x 2
+        '''
+        # source: https://en.wikipedia.org/wiki/Trilinear_interpolation
+        weights = (x - voxel_min_vertex)/(voxel_max_vertex-voxel_min_vertex) # B x 3
+
+        # step 1
+        # 0->000, 1->001, 2->010, 3->011, 4->100, 5->101, 6->110, 7->111
+        c00 = voxel_embedds[:,0]*(1-weights[:,0][:,None]) + voxel_embedds[:,4]*weights[:,0][:,None]
+        c01 = voxel_embedds[:,1]*(1-weights[:,0][:,None]) + voxel_embedds[:,5]*weights[:,0][:,None]
+        c10 = voxel_embedds[:,2]*(1-weights[:,0][:,None]) + voxel_embedds[:,6]*weights[:,0][:,None]
+        c11 = voxel_embedds[:,3]*(1-weights[:,0][:,None]) + voxel_embedds[:,7]*weights[:,0][:,None]
+
+        # step 2
+        c0 = c00*(1-weights[:,1][:,None]) + c10*weights[:,1][:,None]
+        c1 = c01*(1-weights[:,1][:,None]) + c11*weights[:,1][:,None]
+
+        # step 3
+        c = c0*(1-weights[:,2][:,None]) + c1*weights[:,2][:,None]
+
+        return c
+
+    def forward(self, x):
+        # x is 3D point position: B x 3
+        x_embedded_all = []
+        for i in range(self.n_levels):
+            resolution = torch.floor(self.base_resolution * self.b**i)
+            voxel_min_vertex, voxel_max_vertex, hashed_voxel_indices = get_voxel_vertices(\
+                                                x, self.bounding_box, \
+                                                resolution, self.log2_hashmap_size)
+            
+            voxel_embedds = self.embeddings[i](hashed_voxel_indices)
+
+            x_embedded = self.trilinear_interp(x, voxel_min_vertex, voxel_max_vertex, voxel_embedds)
+            x_embedded_all.append(x_embedded)
+
+        return torch.cat(x_embedded_all, dim=-1)
+
+def softexp(x: torch.Tensor):
+    linear_mask = x >= 1
+    # recipr_mask = x <= -1
+    expont_mask = ~linear_mask # torch.logical_and(~linear_mask, ~recipr_mask)
+    y = torch.zeros_like(x)
+    y.masked_scatter_(linear_mask, torch.e * torch.masked_select(x, linear_mask))
+    # y.masked_scatter_(recipr_mask, - 1.0 / (torch.e * torch.masked_select(x, recipr_mask)))
+    y.masked_scatter_(expont_mask, torch.exp(torch.masked_select(x, expont_mask)))
+    return y
+
 def build_rotation(r):
     norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
 
@@ -82,6 +195,8 @@ class NeRFNetwork(NeRFRenderer):
         self.geo_feat_dim = geo_feat_dim
 
         self.encoder, self.in_dim = get_encoder(encoding, desired_resolution=2048 * bound)
+        # self.encoder = HashEmbedder((0, 1), finest_resolution=2048 * bound)
+        # self.in_dim  = self.encoder.n_levels * self.encoder.n_features_per_level
 
         sigma_net = []
         for l in range(num_layers):
@@ -114,36 +229,39 @@ class NeRFNetwork(NeRFRenderer):
     
     def density(self, x, d_i):
         # sigma
+        x = x.contiguous()
+        d_i = d_i.contiguous()
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
-        h = self.sigma_net(self.encoder(x.detach()))
-        sigma = torch.exp(h[..., 0:1])
+        h = self.sigma_net(self.encoder(x))
+        sigma = softexp(h[..., 0:1].clone())
         scaling = torch.sigmoid(h[..., 1+3:1+3+3])
         quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
         cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
         integral = self.calc_PA(cov, d_i)
         sigma_t = sigma * integral # (N, 1)
-        assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
+        # assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
         return sigma_t
 
     def forward(self, x, d_i):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
         # sigma
+        x = x.contiguous()
+        d_i = d_i.contiguous()
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
-        h = self.sigma_net(self.encoder(x.detach()))
-        sigma = torch.exp(h[..., 0:1])
+        h = self.sigma_net(self.encoder(x))
+        sigma = softexp(h[..., 0:1].clone())
         alpha = torch.sigmoid(h[..., 1:1+3])
         scaling = torch.sigmoid(h[..., 1+3:1+3+3])
         quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
         cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
         integral = self.calc_PA(cov, d_i)
         sigma_t = sigma * integral # (N, 1)
-        assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
+        # assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
 
         # Importance Sampling VNDF
-        @torch.no_grad()
         def sample_VNDF(batch_size=1):
-            omega_i = d_i
+            omega_i = d_i.detach()
             omega_j = torch.nn.functional.normalize(torch.cross(torch.tensor([0., 0., 1.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i), omega_i))
             omega_k = torch.nn.functional.normalize(torch.cross(omega_i, omega_j))
             S_kk = self.calc_PA(cov, omega_k, omega_k)
@@ -174,10 +292,11 @@ class NeRFNetwork(NeRFRenderer):
             d_out_kji = torch.nn.functional.normalize(p_u * M_k[:, None, :] + p_v * M_j[:, None, :] + p_w * M_i[:, None, :], dim=-1) # (N, b, 3)
             return torch.nn.functional.normalize((torch.stack((omega_k, omega_j, omega_i), dim=-1) @ d_out_kji.transpose(-1, -2)).transpose(-1, -2), dim=-1).squeeze(-2) # (N, ?, 3)
 
-        d_m = sample_VNDF().detach() # (N, 3)
-        mask = (d_m * d_i).sum(dim=-1) > 0
-        d_m[mask] = -d_m[mask]
-        d_o = (-d_i + 2.0 * d_m * (d_m * d_i).sum(dim=-1, keepdim=True)).detach()
+        d_m = sample_VNDF() # (N, 3)
+        # mask = (d_m * d_i).sum(dim=-1) > 0
+        # d_m[mask] = -d_m[mask]
+        d_o = (-d_i + 2.0 * d_m * (d_m * d_i).sum(dim=-1, keepdim=True)).contiguous().detach()
+        # assert torch.all((torch.linalg.norm(d_o, dim=-1) - 1.).abs() < 1E-5), f'{torch.linalg.norm(d_o, dim=-1).min()}'
         
         rho = self.calc_NDF(scaling, cov_inv, d_m) / (4.0 * integral)
         fused_rho = alpha * sigma_t * rho / (rho.detach() + 1E-8)

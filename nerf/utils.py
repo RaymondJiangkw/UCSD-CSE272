@@ -877,8 +877,8 @@ class Trainer(object):
 
             for name, tensor in self.model.named_parameters():
                 if torch.any(torch.isnan(tensor.grad)):
-                    print(loss, name, torch.isnan(tensor.grad).sum())
-                    tensor.grad = None
+                    print(name, torch.isnan(tensor.grad).sum().item(), tensor.grad.shape)
+                    tensor.grad = torch.nan_to_num(tensor.grad)
 
             self.optimizer.step()
             # self.scaler.scale(loss).backward()
@@ -966,8 +966,8 @@ class Trainer(object):
             for data in loader:    
                 self.local_step += 1
 
-                with torch.cuda.amp.autocast(enabled=self.fp16):
-                    preds, truths, loss = self.eval_step(data)
+                # with torch.cuda.amp.autocast(enabled=self.fp16):
+                preds, truths, loss = self.eval_step(data)
 
                 # all_gather/reduce the statistics (NCCL only support all_*)
                 if self.world_size > 1:
