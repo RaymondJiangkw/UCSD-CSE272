@@ -206,7 +206,7 @@ class NeRFNetwork(NeRFRenderer):
                 in_dim = hidden_dim
             
             if l == num_layers - 1:
-                out_dim = 1 + 3 + 3 + 4
+                out_dim = 1 + 3 + 2 + 4
             else:
                 out_dim = hidden_dim
             
@@ -225,7 +225,7 @@ class NeRFNetwork(NeRFRenderer):
     
     def calc_PA(self, cov, d, d_p=None):
         if d_p is None: d_p = d
-        return torch.sqrt((d[..., None, :] @ cov @ d_p[..., :, None]).squeeze(-1).clamp_min(0.))
+        return torch.sqrt((d[..., None, :] @ cov @ d_p[..., :, None]).squeeze(-1).clamp_min(1e-8))
     
     def density(self, x, d_i):
         # sigma
@@ -234,10 +234,21 @@ class NeRFNetwork(NeRFRenderer):
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
         h = self.sigma_net(self.encoder(x))
         sigma = softexp(h[..., 0:1].clone())
-        scaling = torch.sigmoid(h[..., 1+3:1+3+3])
-        quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
+        scaling = torch.sigmoid(h[..., 1+3:1+3+2])
+        scaling = torch.cat((
+            scaling, torch.ones_like(scaling[..., :1])
+        ), dim=-1)
+        quaternion = h[..., 1+3+2:1+3+2+4]
+        quaternion = torch.cat((
+            quaternion[..., :1] + 1, quaternion[..., 1:]
+        ), dim=-1)
+        quaternion = torch.nn.functional.normalize(quaternion)
         cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
+        assert torch.all(~torch.isnan(cov))
+        assert torch.all(~torch.isnan(cov_inv))
         integral = self.calc_PA(cov, d_i)
+        assert torch.all(~torch.isnan(integral))
+        assert torch.all(torch.isfinite(integral))
         sigma_t = sigma * integral # (N, 1)
         # assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
         return sigma_t
@@ -246,41 +257,89 @@ class NeRFNetwork(NeRFRenderer):
         # x: [N, 3], in [-bound, bound]
         # d: [N, 3], nomalized in [-1, 1]
         # sigma
-        x = x.contiguous()
-        d_i = d_i.contiguous()
+        x = x.contiguous().detach()
+        d_i = d_i.contiguous().detach()
+        assert torch.all(~torch.isnan(x))
+        assert torch.all(~torch.isnan(d_i))
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
-        h = self.sigma_net(self.encoder(x))
+        h = self.encoder(x)
+        assert torch.all(~torch.isnan(h))
+        h = self.sigma_net(h)
+        assert torch.all(~torch.isnan(h))
         sigma = softexp(h[..., 0:1].clone())
         alpha = torch.sigmoid(h[..., 1:1+3])
-        scaling = torch.sigmoid(h[..., 1+3:1+3+3])
-        quaternion = h[..., 1+3+3:1+3+3+4]; quaternion[..., 0] = quaternion[..., 0] + 1; quaternion = torch.nn.functional.normalize(quaternion)
+        scaling = torch.sigmoid(h[..., 1+3:1+3+2])
+        scaling = torch.cat((
+            scaling, torch.ones_like(scaling[..., :1])
+        ), dim=-1)
+        quaternion = h[..., 1+3+2:1+3+2+4]
+        quaternion = torch.cat((
+            quaternion[..., :1] + 1, quaternion[..., 1:]
+        ), dim=-1)
+        quaternion = torch.nn.functional.normalize(quaternion)
         cov, cov_inv = build_covariance_from_scaling_rotation(scaling, quaternion)
+        assert torch.all(~torch.isnan(cov))
+        assert torch.all(~torch.isnan(cov_inv))
         integral = self.calc_PA(cov, d_i)
+        assert torch.all(~torch.isnan(integral))
         sigma_t = sigma * integral # (N, 1)
+        assert torch.all(~torch.isnan(sigma_t))
         # assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
 
         # Importance Sampling VNDF
+        @torch.no_grad()
         def sample_VNDF(batch_size=1):
-            omega_i = d_i.detach()
+            omega_i = d_i
             omega_j = torch.nn.functional.normalize(torch.cross(torch.tensor([0., 0., 1.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i), omega_i))
+            mask = torch.linalg.vector_norm(omega_j, ord=2, dim=-1) < 1e-3
+            omega_j[mask] = torch.nn.functional.normalize(torch.cross(torch.tensor([1., 0., 0.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i[mask]), omega_i[mask]))
             omega_k = torch.nn.functional.normalize(torch.cross(omega_i, omega_j))
+            assert torch.all((1. - torch.linalg.vector_norm(omega_i, ord=2, dim=-1)).abs() < 1e-3)
+            assert torch.all((1. - torch.linalg.vector_norm(omega_j, ord=2, dim=-1)).abs() < 1e-3)
+            assert torch.all((1. - torch.linalg.vector_norm(omega_k, ord=2, dim=-1)).abs() < 1e-3)
+            assert torch.all((omega_i * omega_j).sum(dim=-1).abs() < 1e-3)
+            assert torch.all((omega_i * omega_k).sum(dim=-1).abs() < 1e-3)
+            assert torch.all((omega_k * omega_j).sum(dim=-1).abs() < 1e-3)
+            assert torch.all(~torch.isnan(omega_i))
+            assert torch.all(~torch.isnan(omega_j))
+            assert torch.all(~torch.isnan(omega_k))
             S_kk = self.calc_PA(cov, omega_k, omega_k)
+            assert torch.all(torch.isfinite(S_kk))
             S_kj = self.calc_PA(cov, omega_k, omega_j)
+            assert torch.all(torch.isfinite(S_kj))
             S_ki = self.calc_PA(cov, omega_k, omega_i)
+            assert torch.all(torch.isfinite(S_ki))
             S_jj = self.calc_PA(cov, omega_j, omega_j)
+            assert torch.all(torch.isfinite(S_jj))
             S_ji = self.calc_PA(cov, omega_j, omega_i)
+            assert torch.all(torch.isfinite(S_ji))
             S_ii = self.calc_PA(cov, omega_i, omega_i)
+            assert torch.all(torch.isfinite(S_ii))
             S_kji = torch.concatenate((
                 S_kk, S_kj, S_ki, 
                 S_kj, S_jj, S_ji, 
                 S_ki, S_ji, S_ii, 
             ), dim=-1).reshape(-1, 3, 3)
-            M_k = torch.sqrt((torch.linalg.det(S_kji)[..., None] * (1 / (S_jj * S_ii - S_ji * S_ji))).clamp_min(0.))
+            assert torch.all(~torch.isnan(S_kji))
+            assert torch.all(torch.isfinite(S_kji))
+            M_k = torch.sqrt((torch.linalg.det(S_kji).clamp_min(0.)[..., None] * (1 / (S_jj * S_ii - S_ji * S_ji).clamp_min(1e-8))))
+            assert torch.all(~torch.isnan(torch.linalg.det(S_kji))), f'{torch.linalg.det(S_kji)}'
+            assert torch.all(~torch.isnan((1 / (S_jj * S_ii - S_ji * S_ji + 1E-8))))
+            assert torch.all(~torch.isnan(M_k))
+            assert torch.all(torch.isfinite(M_k))
             M_k = torch.concatenate((M_k, torch.zeros_like(M_k), torch.zeros_like(M_k)), dim=-1)
             M_j_1 = - (S_ki * S_ji - S_kj * S_ii) * torch.rsqrt(torch.clamp_min(S_jj * S_ii - S_ji * S_ji, 1e-8))
+            assert torch.all(~torch.isnan(M_j_1))
+            assert torch.all(torch.isfinite(M_j_1))
             M_j_2 = torch.sqrt(torch.clamp_min(S_jj * S_ii - S_ji * S_ji, 0.))
+            assert torch.all(~torch.isnan(M_j_2))
+            assert torch.all(torch.isfinite(M_j_2))
             M_j = torch.rsqrt(S_ii.clamp_min(1e-8)) * torch.concatenate((M_j_1, M_j_2, torch.zeros_like(M_j_1)), dim=-1)
+            assert torch.all(~torch.isnan(M_j))
+            assert torch.all(torch.isfinite(M_j))
             M_i = torch.rsqrt(S_ii.clamp_min(1e-8)) * torch.concatenate((S_ki, S_ji, S_ii), dim=-1)
+            assert torch.all(~torch.isnan(M_i))
+            assert torch.all(torch.isfinite(M_i))
 
             B = S_kk.shape[0]
             
@@ -289,16 +348,24 @@ class NeRFNetwork(NeRFRenderer):
             p_u = torch.sqrt(U_1) * torch.cos(2 * torch.pi * U_2)
             p_v = torch.sqrt(U_1) * torch.sin(2 * torch.pi * U_2)
             p_w = torch.sqrt(1 - p_u ** 2 - p_v ** 2)
-            d_out_kji = torch.nn.functional.normalize(p_u * M_k[:, None, :] + p_v * M_j[:, None, :] + p_w * M_i[:, None, :], dim=-1) # (N, b, 3)
-            return torch.nn.functional.normalize((torch.stack((omega_k, omega_j, omega_i), dim=-1) @ d_out_kji.transpose(-1, -2)).transpose(-1, -2), dim=-1).squeeze(-2) # (N, ?, 3)
+            assert torch.all(~torch.isnan(p_u)), f'{U_1.min()}, {U_1.max()}, {U_2.min()}, {U_2.max()}'
+            assert torch.all(~torch.isnan(p_v)), f'{U_1.min()}, {U_1.max()}, {U_2.min()}, {U_2.max()}'
+            assert torch.all(~torch.isnan(p_w)), f'{(1 - p_u ** 2 - p_v ** 2).min()}'
+            d_out_kji = p_u * M_k[:, None, :] + p_v * M_j[:, None, :] + p_w * M_i[:, None, :]
+            assert torch.all(~torch.isnan(d_out_kji))
+            d_out_kji_2 = torch.nn.functional.normalize(d_out_kji, dim=-1) # (N, b, 3)
+            assert torch.all(~torch.isnan(d_out_kji_2)), f'{torch.linalg.vector_norm(d_out_kji, ord=2, dim=-1).min()}, {torch.linalg.vector_norm(d_out_kji, ord=2, dim=-1).max()}'
+            return torch.nn.functional.normalize((torch.stack((omega_k, omega_j, omega_i), dim=-1) @ d_out_kji_2.transpose(-1, -2)).transpose(-1, -2), dim=-1).squeeze(-2) # (N, ?, 3)
 
-        d_m = sample_VNDF() # (N, 3)
+        d_m = sample_VNDF().detach() # (N, 3)
+        assert torch.all(~torch.isnan(d_m))
         # mask = (d_m * d_i).sum(dim=-1) > 0
         # d_m[mask] = -d_m[mask]
         d_o = (-d_i + 2.0 * d_m * (d_m * d_i).sum(dim=-1, keepdim=True)).contiguous().detach()
-        # assert torch.all((torch.linalg.norm(d_o, dim=-1) - 1.).abs() < 1E-5), f'{torch.linalg.norm(d_o, dim=-1).min()}'
+        assert torch.all((torch.linalg.norm(d_o, dim=-1) - 1.).abs() < 1E-5), f'{torch.linalg.norm(d_o, dim=-1).min()}'
         
         rho = self.calc_NDF(scaling, cov_inv, d_m) / (4.0 * integral)
+        assert torch.all(~torch.isnan(rho))
         fused_rho = alpha * sigma_t * rho / (rho.detach() + 1E-8)
         
         return {

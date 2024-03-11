@@ -138,31 +138,6 @@ class NeRFRenderer(nn.Module):
             if len(current_throughput) <= 0:
                 break
 
-            def estimate_transmittance(b_rays_o, b_rays_d, near, far):
-                # Using a biased estimator to estimate the integral
-                # Different from Null-scattering. Hopefully biased estimator can be 
-                # even more friendly to optimize.
-                z_vals = torch.lerp(near, far, torch.linspace(0., 1., upsample_steps, device=b_rays_t.device)[None, :]) # (N, M)
-                # Perturb sampled positions
-                sample_dist = (far - near) / upsample_steps # (N, 1)
-                z_vals = z_vals + (torch.rand(z_vals.shape, device=device) - 0.5) * sample_dist
-                # Upsample sampled positions (Importance Sampling)
-                with torch.no_grad():
-                    # print(b_rays_o.shape, b_rays_d.shape, z_vals.shape, (b_rays_o[:, None, :] + b_rays_d[:, None, :] * z_vals[:, :, None]).shape)
-                    sigma = self.density((b_rays_o[:, None, :] + b_rays_d[:, None, :] * z_vals[:, :, None]).reshape(-1, 3), b_rays_d[:, None, :].expand(-1, upsample_steps, -1).reshape(-1, 3)).reshape_as(z_vals) # (N, M)
-                    deltas = z_vals[..., 1:] - z_vals[..., :-1] # (N, M-1)
-                    deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1) # (N, M)
-                    alphas = 1 - torch.exp(-deltas * self.density_scale * sigma) # (N, M)
-                    alphas_shifted = torch.cat([torch.ones_like(alphas[..., :1]), 1 - alphas + 1e-15], dim=-1) # (N, M+1)
-                    weights = alphas * torch.cumprod(alphas_shifted, dim=-1)[..., :-1] # (N, M)
-                    z_vals_mid = (z_vals[..., :-1] + 0.5 * deltas[..., :-1]) # (N, M-1)
-                    new_z_vals = sample_pdf(z_vals_mid, weights[:, 1:-1], upsample_steps, det=not self.training)[0].detach() # (N, M)
-                    z_vals = torch.sort(torch.cat((z_vals, new_z_vals), dim=-1), dim=-1).values # (N, 2 * M)
-                sigma = self.density((b_rays_o[:, None, :] + b_rays_d[:, None, :] * z_vals[:, :, None]).reshape(-1, 3), b_rays_d[:, None, :].expand(-1, 2 * upsample_steps, -1).reshape(-1, 3)).reshape_as(z_vals) # (N, 2 * M)
-                deltas = z_vals[..., 1:] - z_vals[..., :-1] # (N, 2 * M - 1)
-                deltas = torch.cat([deltas, sample_dist * torch.ones_like(deltas[..., :1])], dim=-1) # (N, 2 * M)
-                return torch.exp((- sigma * deltas).sum(dim=-1, keepdim=True)) # (N, 1)
-
             # || o + d * t ||_2^2 == bound^2
             hit_a = torch.square(b_rays_d).sum(dim=-1) # (n, )
             hit_b = 2.0 * (b_rays_d * b_rays_o).sum(dim=-1) # (n, )
@@ -196,7 +171,7 @@ class NeRFRenderer(nn.Module):
             if hit_mask.sum() > 0:
                 denom = torch.exp(- b_rays_majorant[:, None][hit_mask] * (b_fars[:, None][hit_mask] - b_nears[:, None][hit_mask])) + 1E-8
                 # print('denom:', denom.min(), denom.max())
-                rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * estimate_transmittance(b_rays_o[hit_mask], b_rays_d[hit_mask], b_nears[:, None][hit_mask], b_fars[:, None][hit_mask]) * self.sample_env_map(b_rays_o[hit_mask] + b_rays_d[hit_mask] * b_fars[:, None][hit_mask]) / denom
+                rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * (denom / denom.detach()) * self.sample_env_map(b_rays_o[hit_mask] + b_rays_d[hit_mask] * b_fars[:, None][hit_mask])
 
             if hit_mask.sum() == len(hit_mask):
                 break
@@ -209,14 +184,26 @@ class NeRFRenderer(nn.Module):
             b_nears  = b_nears[~hit_mask][:, None].contiguous()   # (N, 1)
             b_fars   = b_fars[~hit_mask][:, None].contiguous()    # (N, 1)
             current_throughput = current_throughput[~hit_mask].contiguous()  # (N, 3)
+            transmittance = torch.exp(- b_rays_majorant[:, None] * (b_rays_t - b_nears) )
+            denom = (b_rays_majorant[:, None] * transmittance).detach()
+            current_throughput = current_throughput * (transmittance / denom)
             b_rays_o = (b_rays_o + b_rays_d * b_rays_t).detach()
             out = self.forward(b_rays_o, b_rays_d)
             # update max sigma
             max_sigma = max(max_sigma, b_rays_majorant.max().item())
-            b_rays_d = out["d_out"]
-            denom = b_rays_majorant[:, None] * torch.exp(-b_rays_majorant[:, None] * (b_rays_t - b_nears)) + 1E-8
-            current_throughput = current_throughput * estimate_transmittance(b_rays_o, b_rays_d, b_nears, b_rays_t.detach()) * out["fused_rho"] / denom
-            # print('denom 2:', denom.min(), denom.max())
+
+            scatter_prob = torch.clamp_max(out["sigma_t"].squeeze(1) / b_rays_majorant, 1.0)
+            scatter_mask = torch.rand_like(scatter_prob) < scatter_prob
+
+            # Hit Real Particles
+            b_rays_d = b_rays_d.clone()
+            b_rays_d[scatter_mask] = out["d_out"][scatter_mask]
+            current_throughput = current_throughput.clone()
+            current_throughput[scatter_mask] = (current_throughput[scatter_mask] / (scatter_prob[:, None][scatter_mask] + 1E-8)) * out["fused_rho"][scatter_mask]
+
+            # Hit Fake Particles
+            current_throughput = current_throughput.clone()
+            current_throughput[~scatter_mask] = current_throughput[~scatter_mask] / (1 - scatter_prob[:, None][~scatter_mask] + 1E-8)
 
             # Russian roulette
             if current_depth >= rr_depth:

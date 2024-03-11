@@ -12,6 +12,7 @@ from loss import huber_loss
 #torch.autograd.set_detect_anomaly(True)
 
 if __name__ == '__main__':
+    torch.autograd.set_detect_anomaly(True)
     parser = argparse.ArgumentParser()
     parser.add_argument('path', type=str)
     parser.add_argument('-O', action='store_true', help="equals --fp16 --cuda_ray --preload")
