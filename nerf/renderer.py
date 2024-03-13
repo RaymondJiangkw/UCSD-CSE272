@@ -87,7 +87,7 @@ class NeRFRenderer(nn.Module):
         # extra state for cuda raymarching
         self.cuda_ray = cuda_ray
         self.sigma_majorant = 1. # Should be dynamically adjusted
-        self.env_map = torch.nn.Parameter(torch.zeros(1, 3, 32, 64))
+        self.env_map = torch.nn.Parameter(torch.zeros(1, 3, 128, 256))
     
     def forward(self, x, d):
         raise NotImplementedError()
