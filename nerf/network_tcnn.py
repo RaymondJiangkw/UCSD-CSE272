@@ -206,7 +206,7 @@ class NeRFNetwork(NeRFRenderer):
                 in_dim = hidden_dim
             
             if l == num_layers - 1:
-                out_dim = 1 + 3 + 2 + 4
+                out_dim = 3 + 3 + 2 + 4
             else:
                 out_dim = hidden_dim
             
@@ -233,12 +233,12 @@ class NeRFNetwork(NeRFRenderer):
         d_i = d_i.contiguous()
         x = (x + self.bound) / (2 * self.bound) # to [0, 1]
         h = self.sigma_net(self.encoder(x))
-        sigma = softexp(h[..., 0:1].clone())
-        scaling = torch.sigmoid(h[..., 1+3:1+3+2])
+        sigma = softexp(h[..., 0:3].clone())
+        scaling = torch.sigmoid(h[..., 3+3:3+3+2])
         scaling = torch.cat((
             scaling, torch.ones_like(scaling[..., :1])
         ), dim=-1)
-        quaternion = h[..., 1+3+2:1+3+2+4]
+        quaternion = h[..., 3+3+2:3+3+2+4]
         quaternion = torch.cat((
             quaternion[..., :1] + 1, quaternion[..., 1:]
         ), dim=-1)
@@ -266,13 +266,13 @@ class NeRFNetwork(NeRFRenderer):
         assert torch.all(~torch.isnan(h))
         h = self.sigma_net(h)
         assert torch.all(~torch.isnan(h))
-        sigma = softexp(h[..., 0:1].clone())
-        alpha = torch.sigmoid(h[..., 1:1+3])
-        scaling = torch.sigmoid(h[..., 1+3:1+3+2])
+        sigma = softexp(h[..., 0:3].clone())
+        alpha = torch.sigmoid(h[..., 3:3+3])
+        scaling = torch.sigmoid(h[..., 3+3:3+3+2])
         scaling = torch.cat((
             scaling, torch.ones_like(scaling[..., :1])
         ), dim=-1)
-        quaternion = h[..., 1+3+2:1+3+2+4]
+        quaternion = h[..., 3+3+2:3+3+2+4]
         quaternion = torch.cat((
             quaternion[..., :1] + 1, quaternion[..., 1:]
         ), dim=-1)
@@ -282,7 +282,7 @@ class NeRFNetwork(NeRFRenderer):
         assert torch.all(~torch.isnan(cov_inv))
         integral = self.calc_PA(cov, d_i)
         assert torch.all(~torch.isnan(integral))
-        sigma_t = sigma * integral # (N, 1)
+        sigma_t = sigma * integral # (N, 3)
         assert torch.all(~torch.isnan(sigma_t))
         # assert torch.all(sigma_t >= 0), f"{sigma.min()}, {sigma.max()}, {integral.min()}, {integral.max()}"
 
@@ -322,16 +322,16 @@ class NeRFNetwork(NeRFRenderer):
             ), dim=-1).reshape(-1, 3, 3)
             assert torch.all(~torch.isnan(S_kji))
             assert torch.all(torch.isfinite(S_kji))
-            M_k = torch.sqrt((torch.linalg.det(S_kji).clamp_min(0.)[..., None] * (1 / (S_jj * S_ii - S_ji * S_ji).clamp_min(1e-8))))
             assert torch.all(~torch.isnan(torch.linalg.det(S_kji))), f'{torch.linalg.det(S_kji)}'
-            assert torch.all(~torch.isnan((1 / (S_jj * S_ii - S_ji * S_ji + 1E-8))))
+            assert torch.all(~torch.isnan((1 / (S_jj * S_ii - S_ji * S_ji))))
+            M_k = torch.sqrt((torch.linalg.det(S_kji).clamp_min(1e-8)[..., None] * (1 / (S_jj * S_ii - S_ji * S_ji).clamp_min(1e-8))))
             assert torch.all(~torch.isnan(M_k))
             assert torch.all(torch.isfinite(M_k))
             M_k = torch.concatenate((M_k, torch.zeros_like(M_k), torch.zeros_like(M_k)), dim=-1)
             M_j_1 = - (S_ki * S_ji - S_kj * S_ii) * torch.rsqrt(torch.clamp_min(S_jj * S_ii - S_ji * S_ji, 1e-8))
             assert torch.all(~torch.isnan(M_j_1))
             assert torch.all(torch.isfinite(M_j_1))
-            M_j_2 = torch.sqrt(torch.clamp_min(S_jj * S_ii - S_ji * S_ji, 0.))
+            M_j_2 = torch.sqrt(torch.clamp_min(S_jj * S_ii - S_ji * S_ji, 1e-8))
             assert torch.all(~torch.isnan(M_j_2))
             assert torch.all(torch.isfinite(M_j_2))
             M_j = torch.rsqrt(S_ii.clamp_min(1e-8)) * torch.concatenate((M_j_1, M_j_2, torch.zeros_like(M_j_1)), dim=-1)

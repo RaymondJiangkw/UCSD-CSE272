@@ -514,6 +514,7 @@ class Trainer(object):
         # MSE loss
         # loss = self.criterion(pred_rgb, gt_rgb).mean(-1)
         # print('Loss:', loss.max(), loss.min())
+        # print('Pred RGB:', pred_rgb.min(), pred_rgb.max(), (pred_rgb / (pred_rgb + 1.0)).min(), (pred_rgb / (pred_rgb + 1.0)).max())
         loss = self.criterion(pred_rgb / (pred_rgb + 1.0), gt_rgb).mean(-1)
         # loss = self.criterion(pred_rgb, gt_rgb / (1 - gt_rgb).clamp_min_(1e-2)).mean(-1) # [B, N, 3] --> [B, N]
         # assert torch.all(torch.isfinite(loss))
@@ -907,7 +908,7 @@ class Trainer(object):
                     self.writer.add_scalar("train/env_map_max", self.model.env_map.max(), self.global_step)
                     self.writer.add_scalar("train/env_map_min", self.model.env_map.min(), self.global_step)
                     if self.global_step % 100 == 0:
-                        env_map = torch.exp(self.model.env_map)
+                        env_map = torch.exp(self.model.env_map).expand(-1, 3, -1, -1)
                         self.writer.add_images("train/env_map", (env_map - env_map.min()) / (env_map.max() - env_map.min() + 1E-8), self.global_step)
 
                 if self.scheduler_update_every_step:
@@ -1017,6 +1018,8 @@ class Trainer(object):
 
                     pbar.set_description(f"loss={loss_val:.4f} ({total_loss/self.local_step:.4f})")
                     pbar.update(loader.batch_size)
+                
+                break
 
 
         average_loss = total_loss / self.local_step
