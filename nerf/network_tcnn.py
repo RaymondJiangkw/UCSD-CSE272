@@ -290,14 +290,15 @@ class NeRFNetwork(NeRFRenderer):
         @torch.no_grad()
         def sample_VNDF(batch_size=1):
             omega_i = d_i
-            omega_j = torch.nn.functional.normalize(torch.cross(torch.tensor([0., 0., 1.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i), omega_i))
+            omega_j = torch.nn.functional.normalize(torch.cross(torch.tensor([0., 0., 1.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i), omega_i, dim=-1))
+            # assert torch.all((omega_i * omega_j).sum(dim=-1).abs() < 1e-3), f'{(omega_i * omega_j).sum(dim=-1).abs().min()}, {(omega_i * omega_j).sum(dim=-1).abs().max()}, {torch.linalg.vector_norm(omega_i, ord=2, dim=-1).min()}, {torch.linalg.vector_norm(omega_i, ord=2, dim=-1).max()}, {torch.linalg.vector_norm(omega_j, ord=2, dim=-1).min()}, {torch.linalg.vector_norm(omega_j, ord=2, dim=-1).min()}'
             mask = torch.linalg.vector_norm(omega_j, ord=2, dim=-1) < 1e-3
-            omega_j[mask] = torch.nn.functional.normalize(torch.cross(torch.tensor([1., 0., 0.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i[mask]), omega_i[mask]))
-            omega_k = torch.nn.functional.normalize(torch.cross(omega_i, omega_j))
+            omega_j[mask] = torch.nn.functional.normalize(torch.cross(torch.tensor([1., 0., 0.], device=d_i.device, dtype=d_i.dtype)[None, :].expand_as(omega_i[mask]), omega_i[mask], dim=-1))
+            omega_k = torch.nn.functional.normalize(torch.cross(omega_i, omega_j, dim=-1))
             assert torch.all((1. - torch.linalg.vector_norm(omega_i, ord=2, dim=-1)).abs() < 1e-3)
             assert torch.all((1. - torch.linalg.vector_norm(omega_j, ord=2, dim=-1)).abs() < 1e-3)
             assert torch.all((1. - torch.linalg.vector_norm(omega_k, ord=2, dim=-1)).abs() < 1e-3)
-            assert torch.all((omega_i * omega_j).sum(dim=-1).abs() < 1e-3)
+            assert torch.all((omega_i * omega_j).sum(dim=-1).abs() < 1e-3), f'{(omega_i * omega_j).sum(dim=-1).abs().min()}, {(omega_i * omega_j).sum(dim=-1).abs().max()}, {torch.linalg.vector_norm(omega_i, ord=2, dim=-1).min()}, {torch.linalg.vector_norm(omega_i, ord=2, dim=-1).max()}, {torch.linalg.vector_norm(omega_j, ord=2, dim=-1).min()}, {torch.linalg.vector_norm(omega_j, ord=2, dim=-1).min()}'
             assert torch.all((omega_i * omega_k).sum(dim=-1).abs() < 1e-3)
             assert torch.all((omega_k * omega_j).sum(dim=-1).abs() < 1e-3)
             assert torch.all(~torch.isnan(omega_i))

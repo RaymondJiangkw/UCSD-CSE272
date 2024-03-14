@@ -26,14 +26,14 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt', type=str, default='latest')
     parser.add_argument('--num_rays', type=int, default=512, help="num rays sampled per image for each training step")
     parser.add_argument('--cuda_ray', action='store_true', help="use CUDA raymarching instead of pytorch")
-    parser.add_argument('--max_steps', type=int, default=32, help="max num steps sampled per ray")
-    parser.add_argument('--num_steps', type=int, default=32, help="num steps sampled per ray (only valid when NOT using --cuda_ray)")
+    parser.add_argument('--max_steps', type=int, default=64, help="max num steps sampled per ray")
+    parser.add_argument('--num_steps', type=int, default=64, help="num steps sampled per ray (only valid when NOT using --cuda_ray)")
     parser.add_argument('--indicator_steps', type=int, default=64)
     parser.add_argument('--upsample_steps', type=int, default=64, help="num steps up-sampled per ray (only valid when NOT using --cuda_ray)")
     parser.add_argument('--update_extra_interval', type=int, default=16, help="iter interval to update extra status (only valid when using --cuda_ray)")
-    parser.add_argument('--max_ray_batch', type=int, default=2048, help="batch size of rays at inference to avoid OOM (only valid when NOT using --cuda_ray)")
+    parser.add_argument('--max_ray_batch', type=int, default=512, help="batch size of rays at inference to avoid OOM (only valid when NOT using --cuda_ray)")
     parser.add_argument('--patch_size', type=int, default=1, help="[experimental] render patches in training, so as to apply LPIPS loss. 1 means disabled, use [64, 32, 16] to enable")
-    parser.add_argument('--max_depths', type=int, default=2, help='maximum number of recursive evaluation of integration')
+    parser.add_argument('--max_depths', type=int, default=5, help='maximum number of recursive evaluation of integration')
     parser.add_argument('--rr_depth', type=int, default=5, help='When Russian roulette starts to take effects')
     parser.add_argument('--upsample_interval', type=int, default=100, help="After number of epoches, doubling the number of steps")
 
@@ -136,7 +136,7 @@ if __name__ == '__main__':
 
         optimizer = lambda model: torch.optim.Adam(model.get_params(opt.lr), betas=(0.9, 0.99), eps=1e-15)
 
-        train_loader = NeRFDataset(opt, device=device, type='train', downscale=4).dataloader()
+        train_loader = NeRFDataset(opt, device=device, type='train', downscale=8).dataloader()
 
         # decay to 0.1 * init_lr at last iter step
         scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
@@ -149,7 +149,7 @@ if __name__ == '__main__':
             gui.render()
         
         else:
-            valid_loader = NeRFDataset(opt, device=device, type='val', downscale=4).dataloader()
+            valid_loader = NeRFDataset(opt, device=device, type='val', downscale=8).dataloader()
 
             max_epoch = np.ceil(opt.iters / len(train_loader)).astype(np.int32)
             trainer.train(train_loader, valid_loader, max_epoch)

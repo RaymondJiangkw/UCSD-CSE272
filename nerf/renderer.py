@@ -87,7 +87,7 @@ class NeRFRenderer(nn.Module):
         # extra state for cuda raymarching
         self.cuda_ray = cuda_ray
         self.sigma_majorant = 1. # Should be dynamically adjusted
-        self.env_map = torch.nn.Parameter(torch.zeros(1, 3, 128, 256))
+        self.env_map = torch.nn.Parameter(torch.zeros(1, 3, 32, 64))
     
     def forward(self, x, d):
         raise NotImplementedError()
@@ -128,6 +128,7 @@ class NeRFRenderer(nn.Module):
         device = rays_o.device
         tot = num_steps
         rgbs = torch.zeros((N * tot, 3), device=device, dtype=torch.float32)
+        num_samples = torch.zeros((N * tot, 1), device=device, dtype=torch.float32)
 
         b_rays_o = rays_o[:, None, :].expand(-1, tot, -1).contiguous().reshape(-1, 3) # (n, 3)
         b_rays_d = rays_d[:, None, :].expand(-1, tot, -1).contiguous().reshape(-1, 3) # (n, 3)
@@ -185,6 +186,7 @@ class NeRFRenderer(nn.Module):
                 assert torch.all(~torch.isnan(denom))
                 assert torch.all(~torch.isnan(denom / denom.detach().mean(dim=-1, keepdim=True))), f'{denom.min()}, {denom.max()}, {denom.detach().mean(dim=-1, keepdim=True).min()}, {denom.detach().mean(dim=-1, keepdim=True).max()}'
                 rgbs[b_rays_i[hit_mask]] = rgbs[b_rays_i[hit_mask]] + current_throughput[hit_mask] * (denom / denom.detach().mean(dim=-1, keepdim=True)) * self.sample_env_map(b_rays_o[hit_mask] + b_rays_d[hit_mask] * b_fars[:, None][hit_mask])
+                num_samples[b_rays_i[hit_mask]] = 1
 
             if hit_mask.sum() == len(hit_mask):
                 break
@@ -234,7 +236,8 @@ class NeRFRenderer(nn.Module):
                 rr_prob = rr_prob[~terminate]
                 current_throughput = current_throughput[~terminate] * torch.reciprocal(rr_prob)[:, None]
         assert torch.all(~torch.isnan(rgbs))
-        rgbs = rgbs.reshape(N, tot, 3).mean(dim=1)
+        assert torch.all(~torch.isnan(num_samples))
+        rgbs = rgbs.reshape(N, tot, 3).sum(dim=1) / (num_samples.reshape(N, tot, 1).sum(dim=1).clamp_min(1.))
 
         # calculate color
         image = rgbs # [N, 3], in [0, 1]

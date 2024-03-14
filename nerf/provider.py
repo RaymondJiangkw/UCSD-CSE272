@@ -185,9 +185,9 @@ class NeRFDataset:
             # for colmap, manually split a valid set (the first frame).
             if self.mode == 'colmap':
                 if type == 'train':
-                    frames = frames[1:]
+                    frames = frames # [1:]
                 elif type == 'val':
-                    frames = frames[:1]
+                    frames = frames # [:1]
                 # else 'all' or 'trainval' : use all frames
             
             self.poses = []
